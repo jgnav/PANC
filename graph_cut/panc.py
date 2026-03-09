@@ -207,9 +207,32 @@ def _threshold_gmm(
             weights = nk / nk.sum()
             means_t = (resp * x).sum(dim=0) / nk
             stds = torch.sqrt((resp * (x - means_t[None, :]) ** 2).sum(dim=0) / nk).clamp_min(eps)
-        # Intersection of the two fitted Gaussians
+        # Intersection of the two fitted Gaussians (equal-posterior boundary).
+        # For unequal variances solve the quadratic from equating log-pdfs;
+        # fall back to the midpoint only when variances are nearly equal.
         m1, m2 = means_t[0], means_t[1]
-        return (0.5 * (m1 + m2)).clamp(0.0, 1.0)
+        s1, s2 = stds[0], stds[1]
+        v1, v2 = (s1 ** 2).clamp_min(eps), (s2 ** 2).clamp_min(eps)
+        if torch.abs(v1 - v2) < eps:
+            return (0.5 * (m1 + m2)).clamp(0.0, 1.0)
+        # Quadratic coefficients: a*x^2 + b*x + c = 0
+        a = v1 - v2
+        b = 2 * (m1 * v2 - m2 * v1)
+        c = m2 ** 2 * v1 - m1 ** 2 * v2 + 2 * v1 * v2 * torch.log((s2 / s1).clamp_min(eps))
+        disc = (b ** 2 - 4 * a * c).clamp_min(0.0)
+        r1 = (-b + torch.sqrt(disc)) / (2 * a + eps)
+        r2 = (-b - torch.sqrt(disc)) / (2 * a + eps)
+        # Pick the root that lies between the two means
+        lo, hi = torch.min(m1, m2), torch.max(m1, m2)
+        between1 = (r1 >= lo) & (r1 <= hi)
+        between2 = (r2 >= lo) & (r2 <= hi)
+        if between1:
+            return r1.clamp(0.0, 1.0)
+        if between2:
+            return r2.clamp(0.0, 1.0)
+        # Neither root is between the means — pick the closest to midpoint
+        mid = 0.5 * (m1 + m2)
+        return (r1 if torch.abs(r1 - mid) < torch.abs(r2 - mid) else r2).clamp(0.0, 1.0)
 
 
 def _threshold_platt(
@@ -317,13 +340,17 @@ def panc_segment(
         fiedler_vec = -fiedler_vec
         eig3_vec = -eig3_vec
 
-    # Min-max normalise
-    def _norm(v: torch.Tensor) -> torch.Tensor:
-        lo, hi = v.min(), v.max()
+    # Min-max normalise — exclude anchor nodes so they don't
+    # compress the dynamic range of query / prior scores.
+    def _norm(v: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
+        lo, hi = ref.min(), ref.max()
         return (v - lo) / (hi - lo + eig_eps)
 
-    all_scores = _norm(fiedler_vec)
-    all_eig3 = _norm(eig3_vec)
+    token_scores = fiedler_vec[:Nq + Np]
+    token_eig3 = eig3_vec[:Nq + Np]
+
+    all_scores = _norm(fiedler_vec, token_scores)
+    all_eig3 = _norm(eig3_vec, token_eig3)
 
     anchor_scores = all_scores[-2:].clamp(0, 1)
     q_scores = all_scores[:Nq].clamp(0, 1)
