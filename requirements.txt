@@ -1,9 +1,8 @@
 torch
 torchvision
 numpy
-scikit-learn
+Pillow
 matplotlib
-pillow
-requests
 pycocotools
-jupyter
+scipy
+scikit-learn
